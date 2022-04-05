@@ -301,3 +301,67 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 
 
+ＳＥＮＤＲｅｓｐｏｎｃｅ发送
+
+```
+func (server *Server) sendResponse(sending *sync.Mutex, req *Request, reply interface{}, codec ServerCodec, errmsg string) {
+／／　先得到ｒｅｐｓｐｏｎｓｅ
+	resp := server.getResponse()
+	// Encode the response header
+	／／　得到ｓｅｒｖｉｄｅ　ｍｔｈｏｓ这样，
+	resp.ServiceMethod = req.ServiceMethod
+	if errmsg != "" {
+		resp.Error = errmsg
+		reply = invalidRequest
+	}
+	／／　复制序列号
+	resp.Seq = req.Seq
+	sending.Lock()
+	// 进行压缩
+	err := codec.WriteResponse(resp, reply)
+	if debugLog && err != nil {
+		log.Println("rpc: writing response:", err)
+	}
+	sending.Unlock()
+	server.freeResponse(resp)
+}
+```
+
+// 在ｍ　＊ｍｔｈｏｄＴｙｐｅ　中会维护一个ｎｍｂＣａｌｌｓ数目
+
+这里世界的ｃａｌｌ　会指定一个　ｃａｌｌ
+
+```
+func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
+	if wg != nil {
+		defer wg.Done()
+	}
+	// 上锁记录
+	mtype.Lock()
+	mtype.numCalls++
+	mtype.Unlock()
+	// 找到ｆｕｎ
+	function := mtype.method.Func
+	
+	// Invoke the method, providing a new value for the reply.
+	// 调用方法，提供新的值
+	这里这么调用，
+	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
+	// The return value for the method is an error.
+	找到是否结果是ｅｒｒｏｒ　
+	errInter := returnValues[0].Interface()
+	errmsg := ""
+	if errInter != nil {
+		errmsg = errInter.(error).Error()
+	}
+	server.sendResponse(sending, req, replyv.Interface(), codec, errmsg)
+	server.freeRequest(req)
+}
+```
+
+ｓｅｒｖｅＣｏｎｎDE 
+
+在单链接的情况下。会保存链接直到客户端挂起
+
+# Client文件
+
