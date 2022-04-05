@@ -1,4 +1,4 @@
-package main
+ package main
 
 import (
     "fmt"
@@ -364,4 +364,202 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 在单链接的情况下。会保存链接直到客户端挂起
 
 # Client文件
+
+```
+// Client represents an RPC Client.
+// 客户端必须待变一个RPC客户端
+// There may be multiple outstanding Calls associated
+// with a single Client, and a Client may be used by
+// multiple goroutines simultaneously.
+// 
+type Client struct {
+	codec ClientCodec
+
+	reqMutex sync.Mutex // protects following
+	request  Request
+
+	mutex    sync.Mutex // protects following
+	seq      uint64
+	pending  map[uint64]*Call
+	closing  bool // user has called Close
+	shutdown bool // server has told us to stop
+}
+```
+
+然后这里 感觉就是客户段，有个序列号和锁搞没有竞态环节
+
+
+
+```
+
+
+// A ClientCodec implements writing of RPC requests and
+// reading of RPC responses for the client side of an RPC session.
+// The client calls WriteRequest to write a request to the connection
+// and calls ReadResponseHeader and ReadResponseBody in pairs
+// to read responses. The client calls Close when finished with the
+// connection. ReadResponseBody may be called with a nil
+// argument to force the body of the response to be read and then
+// discarded.
+// ClientCodec 实现了 写rpc 请求并 读取rpc 
+// 客户端调用writeRequest 用于 写request
+// 调用 readResponseHeader 和 readResponseBody 这一对函数读response
+// 客户端关闭 当connection 关闭的时候，ReadResponseBody 可能是nil 来强制读取response
+// 并丢弃，从NewClient 的注释来 获取关于并发控制
+// See NewClient's comment for information about concurrent access.
+type ClientCodec interface {
+	WriteRequest(*Request, interface{}) error
+	ReadResponseHeader(*Response) error
+	ReadResponseBody(interface{}) error
+
+	Close() error
+}
+```
+
+
+
+然后send 函数值 
+
+```
+func (client *Client) send(call *Call) {
+	// 上锁这个req的锁
+	client.reqMutex.Lock()
+	defer client.reqMutex.Unlock()
+
+	// Register this call.
+	// 这个req 感觉是统计维护 序列号
+	client.mutex.Lock()
+	if client.shutdown || client.closing {
+		client.mutex.Unlock()
+		call.Error = ErrShutdown
+		call.done()
+		return
+	}
+	seq := client.seq
+	client.seq++
+	client.pending[seq] = call
+	client.mutex.Unlock()
+
+	// Encode and send the request.
+	// 编码并且发送请求请求，
+	client.request.Seq = seq
+	// 记录一下
+	client.request.ServiceMethod = call.ServiceMethod
+	log.Print(client.request)
+	//  压缩请求 
+	err := client.codec.WriteRequest(&client.request, call.Args)
+	// 这里就是
+	if err != nil {
+		client.mutex.Lock()
+		call = client.pending[seq]
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+		if call != nil {
+			call.Error = err
+			call.done()·
+		}
+	}
+}
+```
+
+input 函数
+
+```
+// 
+func (client *Client) input() {
+	var err error
+	var response Response
+	for err == nil {
+		response = Response{}
+		// 解压 response
+		err = client.codec.ReadResponseHeader(&response)
+		if err != nil {
+			break
+		}
+		seq := response.Seq
+		client.mutex.Lock()
+		call := client.pending[seq]
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+
+		switch {
+		case call == nil:
+			// We've got no pending call. That usually means that
+			// WriteRequest partially failed, and call was already
+			// removed; response is a server telling us about an
+			// error reading request body. We should still attempt
+			// to read error body, but there's no one to give it to.
+			err = client.codec.ReadResponseBody(nil)
+			if err != nil {
+				err = errors.New("reading error body: " + err.Error())
+			}
+		case response.Error != "":
+			// We've got an error response. Give this to the request;
+			// any subsequent requests will get the ReadResponseBody
+			// error if there is one.
+			call.Error = ServerError(response.Error)
+			err = client.codec.ReadResponseBody(nil)
+			if err != nil {
+				err = errors.New("reading error body: " + err.Error())
+			}
+			call.done()
+		default:
+			err = client.codec.ReadResponseBody(call.Reply)
+			if err != nil {
+				call.Error = errors.New("reading body " + err.Error())
+			}
+			call.done()
+		}
+	}
+	// Terminate pending calls.
+	client.reqMutex.Lock()
+	client.mutex.Lock()
+	client.shutdown = true
+	closing := client.closing
+	if err == io.EOF {
+		if closing {
+			err = ErrShutdown
+		} else {
+			err = io.ErrUnexpectedEOF
+		}
+	}
+	for _, call := range client.pending {
+		call.Error = err
+		call.done()
+	}
+	client.mutex.Unlock()
+	client.reqMutex.Unlock()
+	if debugLog && err != io.EOF && !closing {
+		log.Println("rpc: client protocol error:", err)
+	}
+}
+```
+
+```
+// NewClient returns a new Client to handle requests to the
+// set of services at the other end of the connection.
+// It adds a buffer to the write side of the connection so
+// the header and payload are sent as a unit.
+// NewClient 返回一个新的Client 会添加bufuer 哟关于写单侧写 所以头部和负载会作为一个单位发送
+// The read and write halves of the connection are serialized independently,
+//  读写 在链接两端 是独立的 而然 每个半边是可以接受并发的 所以要并发安全
+// so no interlocking is required. However each half may be accessed
+// concurrently so the implementation of conn should protect against
+// concurrent reads or concurrent writes.
+func NewClient(conn io.ReadWriteCloser) *Client {
+	encBuf := bufio.NewWriter(conn)
+	client := &gobClientCodec{conn, gob.NewDecoder(conn), gob.NewEncoder(encBuf), encBuf}
+	return NewClientWithCodec(client)
+}
+```
+
+```
+type gobClientCodec struct {
+	rwc    io.ReadWriteCloser
+	dec    *gob.Decoder
+	enc    *gob.Encoder
+	encBuf *bufio.Writer
+}
+// 用于可客户端压缩
+```
 
