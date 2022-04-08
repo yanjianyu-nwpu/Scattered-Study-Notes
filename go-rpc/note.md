@@ -188,7 +188,9 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	mtype.Lock()
 	mtype.numCalls++
 	mtype.Unlock()
+	// 然后这里找到对应函数
 	function := mtype.method.Func
+	// 调用函数，并返回一个新的返回体
 	// Invoke the method, providing a new value for the reply.
 	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
 	// The return value for the method is an error.
@@ -197,10 +199,107 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	if errInter != nil {
 		errmsg = errInter.(error).Error()
 	}
+	// 然后发送出去
 	server.sendResponse(sending, req, replyv.Interface(), codec, errmsg)
 	server.freeRequest(req)
 }
 ```
 
+## 最后就是如果复用 net/http 包进行注册/监听
 
+```
+// Accept accepts connections on the listener and serves requests
+// for each incoming connection. Accept blocks until the listener
+// returns a non-nil error. The caller typically invokes Accept in a
+// go statement.
+// accept 怎么接受链接 接受一次链接，就开一个线程
+func (server *Server) Accept(lis net.Listener) {
+	for {
+		conn, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		go server.ServeConn(conn)
+	}
+}
+// ServeConn runs the server on a single connection.
+// ServeConn 在单一的链接上
+// ServeConn blocks, serving the connection until the client hangs up.
+// ServeConn 会阻塞，服务这个链接直到客户端断开
+// The caller typically invokes ServeConn in a go statement.
+// caller 会调用serveconn 在一个go 程序里面
+// ServeConn uses the gob wire format (see package gob) on the
+// connection. To use an alternate codec, use ServeCodec.
+// serveConn 使用 gob 写 在这个链接里面。 可以用别的
+// See NewClient's comment for information about concurrent access.
+func (server *Server) ServeConn(conn io.ReadWriteCloser) {
+	buf := bufio.NewWriter(conn)
+	srv := &gobServerCodec{
+		rwc:    conn,
+		dec:    gob.NewDecoder(conn),
+		enc:    gob.NewEncoder(buf),
+		encBuf: buf,
+	}
+	server.ServeCodec(srv)
+}
+// ServeCodec is like ServeConn but uses the specified codec to
+// decode requests and encode responses.
+// ServeCodec 和 ServeConn 类似但是使用 特定的codec 来编码和解码
+func (server *Server) ServeCodec(codec ServerCodec) {
+	sending := new(sync.Mutex)
+	wg := new(sync.WaitGroup)
+	// 会一直轮询直到链接被客户端断掉
+	for {
+		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
+		if err != nil {
+			if debugLog && err != io.EOF {
+				log.Println("rpc:", err)
+			}
+			if !keepReading {
+				break
+			}
+			// send a response if we actually managed to read a header.
+			if req != nil {
+				server.sendResponse(sending, req, invalidRequest, codec, err.Error())
+				server.freeRequest(req)
+			}
+			continue
+		}
+		wg.Add(1)
+		// 这里call 会调用函数，然后发送出去
+		go service.call(server, sending, wg, mtype, req, argv, replyv, codec)
+	}
+	// We've seen that there are no more requests.
+	// Wait for responses to be sent before closing codec.
+	wg.Wait()
+	codec.Close()
+}
+
+// ServeHTTP implements an http.Handler that answers RPC requests.
+// ServeHTTP 实现了一个http.Handler 用于回答RPC 请求
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// req Method 是CONNECT method
+	if req.Method != "CONNECT" {
+		// W.Header().Set() 设置http 头部
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		// 写入头部 之
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		// 得先Connect 
+		io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	} 
+	// io.wRTIE 写入
+	io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	// 存储Conn的
+	server.ServeConn(conn)
+}
+
+```
+
+## 后续的流程图
 
