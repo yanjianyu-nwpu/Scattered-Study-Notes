@@ -207,6 +207,10 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 
 ## 最后就是如果复用 net/http 包进行注册/监听
 
+感觉这里有两个 方向一个Accept 就是链接来了怎么处理，直到返回非nil error
+
+ 一个就是ServeHttp应对单个的请求
+
 ```
 // Accept accepts connections on the listener and serves requests
 // for each incoming connection. Accept blocks until the listener
@@ -288,6 +292,7 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		io.WriteString(w, "405 must CONNECT\n")
 		return
 	}
+	// 这里Hijack 是直接取出tcp ，这里就是直接返回了，正常的链接会等待继续使用
 	conn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
@@ -303,3 +308,4 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 ## 后续的流程图
 
+![Server](E:\Scattered-Study-Notes\go-rpc\Server.png)
