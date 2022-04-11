@@ -308,4 +308,4 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 ## 后续的流程图
 
-![Server](E:\Scattered-Study-Notes\go-rpc\Server.png)
+![Server](Server.png)
